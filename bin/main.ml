@@ -1,3 +1,7 @@
+module Chan = Domainslib.Chan
+
+type 'a message = Task of 'a | Quit
+
 let usage_msg = "littlejane -c <csv file> [-o <result file>] <program name>"
 let args = ref []
 let csv_file = ref ""
@@ -56,33 +60,67 @@ let build_command_args (headers : string list) (row : string list) (direct : str
     ;
     direct @ List.rev !args
 
+let run_instance (arglist : string list) (outputQ : 'b Chan.t) : unit =
+  let arrayargs = Array.of_list arglist in
+    let ic = Unix.open_process_args_in arrayargs.(0) arrayargs in
+      let rec loop (i) =
+        let line = input_line ic in
+          let res = Printf.sprintf "%s, %d, %s" (String.concat ", " arglist) i line in
+            Chan.send outputQ (Task res);
+            loop (i + 1)
+      in
+        try
+          loop (1)
+        with 
+        | End_of_file -> close_in ic
+
+let rec worker (inputQ: 'a Chan.t) (outputQ: 'b Chan.t) : unit =
+  match Chan.recv inputQ with
+  | Task row ->
+      run_instance row outputQ;
+      worker inputQ outputQ 
+  | Quit -> Chan.send outputQ Quit
+
+let output_consumer (outputQ : 'b Chan.t) (producer_count : int) : unit = 
+  let oc =
+    match !output_file with
+      | "" -> Stdlib.stdout
+      | _ -> open_out !output_file
+  in
+      let rec loop (counter : int) : unit = 
+        let () = match Chan.recv outputQ with
+          | Task result -> Printf.fprintf oc "%s\n" result; loop(counter)
+          | Quit -> 
+            let decremented_counter = (counter - 1) in
+              match decremented_counter with
+              | 0 -> ()
+              | _ -> loop decremented_counter
+        in ();
+      in loop producer_count
 
 let () =
   Arg.parse speclist anon_fun usage_msg;
-  let progname, direct_args = parse_args !args in
-      try
-        let headers, rows = load_csv !csv_file in
-          let oc =
-            match !output_file with
-              | "" -> Stdlib.stdout
-              | _ -> open_out !output_file
-          in
-            List.iter (fun row -> 
+  let _, direct_args = parse_args !args in
+    let inputQ = Chan.make_unbounded () in
+      let outputQ = Chan.make_unbounded () in
+        try
+          let headers, rows = load_csv !csv_file in
+            List.iter (fun row ->
               let arglist = build_command_args headers row direct_args in
-                let ic = Unix.open_process_args_in progname (Array.of_list arglist) in
-                  let rec loop (i) =
-                    let line = input_line ic in
-                      Printf.fprintf oc "%s, %d, %s\n" (String.concat ", " arglist) i line;
-                    loop (i + 1)
-                  in
-                    try
-                      loop (1)
-                    with 
-                    | End_of_file -> close_in ic
-            ) rows
-      with 
-      | Unix.Unix_error(Unix.ENOENT, _, prog) -> Printf.fprintf Stdlib.stderr "Failed to open %s\n" prog
-      | Sys_error(reason) -> Printf.fprintf Stdlib.stderr "Failed to read CSV %s\n" reason
-      | e -> let reason = Printexc.to_string e in
-          Printf.fprintf Stdlib.stderr "Unexpected error: %s\n" reason
+                Chan.send inputQ (Task arglist)
+            ) rows;
+            for _ = 1 to !parallelism do
+              Chan.send inputQ Quit
+            done
+            ;
+            let sinkDomain = Domain.spawn(fun _ -> output_consumer outputQ !parallelism) in
+              let domains = Array.init !parallelism
+                (fun _ -> Domain.spawn(fun _ -> worker inputQ outputQ)) in
+              Array.iter Domain.join domains;
+              Domain.join sinkDomain
+        with 
+        | Unix.Unix_error(Unix.ENOENT, _, prog) -> Printf.fprintf Stdlib.stderr "Failed to open %s\n" prog
+        | Sys_error(reason) -> Printf.fprintf Stdlib.stderr "Failed to read CSV %s\n" reason
+        | e -> let reason = Printexc.to_string e in
+            Printf.fprintf Stdlib.stderr "Unexpected error: %s\n" reason
   
