@@ -4,29 +4,30 @@ type 'a message = Task of 'a | Quit
 
 let usage_msg = "littlejane -c <csv file> [-o <result file>] <program name>"
 let args = ref []
+let pass_through_args = ref []
 let csv_file = ref ""
 let parallelism = ref 4
 let output_file = ref ""
 let anon_fun arg = args := !args @ [arg]
+let rest_fun arg = pass_through_args := !pass_through_args @ [arg]
 let speclist = [
   ("-c", Arg.Set_string csv_file, "CSV arguments file name");
   ("-j", Arg.Set_int parallelism, "Amount of concurrency");
-  ("-o", Arg.Set_string output_file, "Optional file to save results to")
+  ("-o", Arg.Set_string output_file, "Optional file to save results to");
+  ("--", Arg.Rest rest_fun, "Other args passed directly to child")
 ]
 
 exception Invalid_csv_file
 exception Program_name_missing
 
-let parse_args (arglist : string list) : string * string list =
+let parse_args (arglist : string list) (direct_arg_list : string list): string * string list =
   let progname = ref "" in
-    let direct_args = ref [] in
-      let () = match arglist with
-        | [] -> raise Program_name_missing
-        | "--" :: _ -> raise Program_name_missing
-        | name :: _ -> progname := name
-      in
-        let full_direct_args = !progname :: !direct_args in
-          !progname, full_direct_args
+    let () = match arglist with
+      | [] -> raise Program_name_missing
+      | name :: _ -> progname := name
+    in
+      let full_direct_args = !progname :: direct_arg_list in
+        !progname, full_direct_args
 
 let load_csv (filename : string) : string list * string list list =
   let headers = ref [] in
@@ -100,7 +101,7 @@ let output_consumer (outputQ : 'b Chan.t) (producer_count : int) : unit =
 
 let () =
   Arg.parse speclist anon_fun usage_msg;
-  let _, direct_args = parse_args !args in
+  let _, direct_args = parse_args !args !pass_through_args in
     let inputQ = Chan.make_unbounded () in
       let outputQ = Chan.make_unbounded () in
         try
